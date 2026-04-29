@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <cstring>
+#include <numa.h>
 
 #include "stats.h"
 #include "numa_utils.h"
