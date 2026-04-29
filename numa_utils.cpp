@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 void pin_thread_to_numa(int cpu_node) {
     if (numa_available() == -1) throw std::runtime_error("NUMA not supported");
@@ -75,17 +76,37 @@ void prefault_memory(void* ptr, size_t size) {
     __asm__ volatile("" ::: "memory");
 }
 
+// Современная, устойчивая калибровка TSC
 double calibrate_tsc_freq_mhz() {
-    uint64_t tsc_start, tsc_end;
-    __asm__ volatile("lfence\nrdtsc\nlfence" : "=A"(tsc_start));
+#ifdef __x86_64__
+    auto read_tsc = []() -> uint64_t {
+        uint32_t lo, hi;
+        __asm__ volatile("lfence; rdtsc; lfence" : "=a"(lo), "=d"(hi));
+        return ((uint64_t)hi << 32) | lo;
+    };
 
-    auto ns_start = std::chrono::high_resolution_clock::now();
-    while (std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::high_resolution_clock::now() - ns_start).count() < 100) {}
-    auto ns_end = std::chrono::high_resolution_clock::now();
+    uint64_t tsc_start = read_tsc();
+    auto ts_start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Точнее busy-wait
+    auto ts_end = std::chrono::steady_clock::now();
+    uint64_t tsc_end = read_tsc();
 
-    __asm__ volatile("lfence\nrdtsc\nlfence" : "=A"(tsc_end));
+    double elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(ts_end - ts_start).count();
+    if (elapsed_us <= 0 || tsc_end <= tsc_start) {
+        std::cerr << "[WARN] TSC calibration failed (non-monotonic). Using fallback 2500 MHz\n";
+        return 2500.0;
+    }
 
-    double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ns_end - ns_start).count();
-    return (tsc_end - tsc_start) / (elapsed_ns * 0.001);
+    double freq_mhz = static_cast<double>(tsc_end - tsc_start) / elapsed_us;
+    // Валидация: реальные CPU 1.0 - 5.5 GHz
+    if (freq_mhz < 1000.0 || freq_mhz > 6000.0) {
+        std::cerr << "[WARN] TSC calibration out of range (" << freq_mhz
+                  << " MHz). Using fallback 2500 MHz\n";
+        return 2500.0;
+    }
+    return freq_mhz;
+#else
+    std::cerr << "[WARN] Non-x86 architecture. Using fallback TSC freq 2500 MHz\n";
+    return 2500.0;
+#endif
 }
