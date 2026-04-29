@@ -7,6 +7,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <cstring>
 
 #include "stats.h"
 #include "numa_utils.h"
@@ -29,37 +30,31 @@ struct ThreadResult {
     std::vector<uint64_t> cycles;
 };
 
-static void worker_thread(const BenchmarkConfig& cfg, const WorkloadParams& params, ThreadResult& result) {
-    WorkloadState state{};
-    prepare_workload(state, params);
-
-    if (cfg.warmup) {
-        // Warmup: 1M итераций без замеров
-        run_workload(params, state, 1'000'000, result.cycles);
-        result.cycles.clear();
-    }
-
-    // Оцениваем количество итераций под длительность
-    // Грубая калибровка на месте не требуется, используем fixed iterations + таймаут
-    // Для точности tail-latency собираем все измерения, ограниченные по времени
-    auto start_time = std::chrono::steady_clock::now();
-    size_t batch = 100'000;
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - start_time).count() >= cfg.duration_sec) break;
-
-        run_workload(params, state, batch, result.cycles);
-    }
-
-    destroy_workload(state);
-}
-
 static WorkloadType parse_workload(const std::string& s) {
     if (s == "ptr_chase") return WorkloadType::POINTER_CHASE;
     if (s == "random") return WorkloadType::RANDOM_ACCESS;
     if (s == "sequential") return WorkloadType::SEQUENTIAL_SCAN;
     if (s == "false_share") return WorkloadType::FALSE_SHARING;
     throw std::runtime_error("Unknown workload: " + s);
+}
+
+static void worker_thread(const BenchmarkConfig& cfg, const WorkloadParams& params, ThreadResult& result) {
+    WorkloadState state{};
+    prepare_workload(state, params);
+
+    if (cfg.warmup) {
+        run_workload(params, state, 1'000'000, result.cycles);
+        result.cycles.clear();
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    size_t batch = 100'000;
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - start_time).count() >= cfg.duration_sec) break;
+        run_workload(params, state, batch, result.cycles);
+    }
+    destroy_workload(state);
 }
 
 int main(int argc, char* argv[]) {
@@ -104,20 +99,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Калибровка TSC
     double freq_mhz = calibrate_tsc_freq_mhz();
     std::cerr << "[INFO] Calibrated TSC: " << freq_mhz << " MHz\n";
 
-    // Выделение памяти (общая для False Sharing, индивидуальная для остальных)
     size_t total_size = cfg.size_mb * 1024ULL * 1024ULL;
-    void* shared_mem = nullptr;
-    if (cfg.workload == WorkloadType::FALSE_SHARING) {
-        // Для false sharing нужен небольшой общий буфер с padding
-        total_size = 64 * cfg.threads;
-    }
+    if (cfg.workload == WorkloadType::FALSE_SHARING) total_size = 64 * cfg.threads;
 
     NumaConfig ncfg{cfg.cpu_node, cfg.mem_node, cfg.interleaved, cfg.huge_pages};
-    shared_mem = allocate_numa_memory(total_size, ncfg);
+    void* shared_mem = allocate_numa_memory(total_size, ncfg);
     prefault_memory(shared_mem, total_size);
 
     std::cerr << "[INFO] Memory allocated on node " << cfg.mem_node << " (interleaved="
@@ -125,13 +114,10 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::thread> threads;
     std::vector<ThreadResult> results(cfg.threads);
-    std::mutex stats_lock;
 
     for (int i = 0; i < cfg.threads; ++i) {
         threads.emplace_back([&cfg, i, shared_mem, total_size, &results]() {
-            // Пиннинг к NUMA node
             pin_thread_to_numa(cfg.cpu_node);
-
             WorkloadParams wp{
                 .mem = shared_mem,
                 .size_bytes = total_size,
@@ -140,21 +126,19 @@ int main(int argc, char* argv[]) {
                 .thread_id = i,
                 .stride = 1
             };
-
             worker_thread(cfg, wp, results[i]);
         });
     }
 
     for (auto& t : threads) t.join();
 
-    // Сбор результатов
     std::vector<uint64_t> merged_cycles;
     size_t total_samples = 0;
     for (auto& r : results) total_samples += r.cycles.size();
     merged_cycles.reserve(total_samples);
     for (auto& r : results) {
         merged_cycles.insert(merged_cycles.end(), r.cycles.begin(), r.cycles.end());
-        r.cycles.clear(); // Освобождаем память
+        r.cycles.clear();
     }
 
     LatencyStats stats = LatencyStats::compute(merged_cycles, freq_mhz);
