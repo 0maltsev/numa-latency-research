@@ -37,8 +37,9 @@ install_deps() {
 
 compile() {
     log "Compiling benchmark..."
-    g++ -O3 -march=native -std=c++17 -flto -lnuma -lpthread \
-        -o "$BENCH_BIN" main.cpp stats.cpp numa_utils.cpp workload.cpp || die "g++ failed"
+    g++ -O3 -march=native -std=c++17 -flto \
+        -o "$BENCH_BIN" main.cpp stats.cpp numa_utils.cpp workload.cpp \
+        -lnuma -lpthread || die "g++ failed"
     chmod +x "$BENCH_BIN"
 }
 
