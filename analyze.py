@@ -3,13 +3,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Iterator
+from typing import Iterator
 
 import numpy as np
 import pandas as pd
 
 # ============================================================================
-# Конфигурация памяти
+# Оптимизированные dtype (экономия памяти)
 # ============================================================================
 
 DTYPES_COMBINED = {
@@ -29,13 +29,13 @@ DTYPES_RAW = {
 }
 
 # ============================================================================
-# Загрузка данных (chunking + dtype)
+# Загрузка данных
 # ============================================================================
 
 def load_combined(results_dir: Path) -> pd.DataFrame:
     path = results_dir / 'combined.csv'
     if not path.exists():
-        raise FileNotFoundError(path)
+        raise FileNotFoundError(f"{path} not found")
 
     try:
         df = pd.read_csv(path, dtype=DTYPES_COMBINED)
@@ -43,14 +43,15 @@ def load_combined(results_dir: Path) -> pd.DataFrame:
         raise RuntimeError(f"Failed to read combined.csv: {e}")
 
     required = {'mode', 'workload', 'threads', 'p50', 'p99', 'p99_9'}
-    if not required.issubset(df.columns):
-        raise ValueError(f"Missing columns: {required - set(df.columns)}")
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
 
     return df
 
 
 def iter_raw_files(results_dir: Path) -> Iterator[tuple[str, Iterator[pd.DataFrame]]]:
-    """Ленивый генератор raw-файлов с chunking"""
+    """Ленивый генератор raw файлов (chunked)"""
     for f in results_dir.glob('*_raw.csv'):
         try:
             chunks = pd.read_csv(
@@ -69,10 +70,7 @@ def iter_raw_files(results_dir: Path) -> Iterator[tuple[str, Iterator[pd.DataFra
 # Векторизированные метрики
 # ============================================================================
 
-def calc_numa_penalty_vectorized(df: pd.DataFrame, percentile='p99') -> list[dict]:
-    """
-    Полностью векторизированный расчёт NUMA penalty
-    """
+def calc_numa_penalty(df: pd.DataFrame, percentile='p99') -> list[dict]:
     pivot = df.pivot_table(
         index=['workload', 'threads', 'size_mb'],
         columns='mode',
@@ -82,8 +80,8 @@ def calc_numa_penalty_vectorized(df: pd.DataFrame, percentile='p99') -> list[dic
     if 'local' not in pivot or 'remote' not in pivot:
         return []
 
-    pivot['abs_penalty'] = pivot['remote'] - pivot['local']
-    pivot['rel_penalty'] = pivot['abs_penalty'] / pivot['local'] * 100
+    pivot['abs_penalty_ns'] = pivot['remote'] - pivot['local']
+    pivot['rel_penalty_pct'] = pivot['abs_penalty_ns'] / pivot['local'] * 100
 
     return pivot.reset_index().rename(columns={
         'local': 'local_ns',
@@ -91,32 +89,31 @@ def calc_numa_penalty_vectorized(df: pd.DataFrame, percentile='p99') -> list[dic
     }).to_dict('records')
 
 
-def calc_tail_ratio(df: pd.DataFrame) -> pd.DataFrame:
+def calc_tail_ratio(df: pd.DataFrame):
     df['p99_p50_ratio'] = df['p99'] / df['p50']
-    return df
 
 
 # ============================================================================
-# Streaming spike detection (без загрузки в память)
+# Streaming spike detection (фикс!)
 # ============================================================================
 
-def detect_spikes_streaming(raw_iter, threshold_factor=3.0, min_cycles=100):
+def detect_spikes_streaming(results_dir: Path,
+                            threshold_factor=3.0,
+                            min_cycles=100):
+
     total = 0
-    spike_count = 0
     max_val = 0
-
-    # Для медианы используем reservoir sampling (упрощённо)
     sample = []
 
-    for _, chunks in raw_iter:
+    # 🔹 Первый проход — собираем sample для медианы
+    for _, chunks in iter_raw_files(results_dir):
         for chunk in chunks:
             vals = chunk['cycles'].values
 
             total += len(vals)
             max_val = max(max_val, vals.max())
 
-            # собираем sample для медианы
-            if len(sample) < 100000:
+            if len(sample) < 100_000:
                 sample.extend(vals[:1000])
 
     if not sample:
@@ -125,8 +122,10 @@ def detect_spikes_streaming(raw_iter, threshold_factor=3.0, min_cycles=100):
     median = np.median(sample)
     threshold = max(median * threshold_factor, min_cycles)
 
-    # второй проход — считаем spikes
-    for _, chunks in iter_raw_files(results_dir):
+    # 🔹 Второй проход — считаем spikes
+    spike_count = 0
+
+    for _, chunks in iter_raw_files(results_dir):  # важно: новый генератор
         for chunk in chunks:
             vals = chunk['cycles'].values
             spike_count += np.sum(vals > threshold)
@@ -142,26 +141,21 @@ def detect_spikes_streaming(raw_iter, threshold_factor=3.0, min_cycles=100):
 
 
 # ============================================================================
-# Perf (оптимизированный pivot)
+# JSON экспорт
 # ============================================================================
 
-def calc_llc_miss_rate(perf_df: pd.DataFrame) -> pd.DataFrame:
-    if perf_df is None or perf_df.empty:
-        return pd.DataFrame()
+def export_json(df, penalties, spike_summary, out_path: Path):
+    data = {
+        "generated_at": pd.Timestamp.now().isoformat(),
+        "runs": df.to_dict("records"),
+        "penalties": penalties,
+        "spikes": spike_summary
+    }
 
-    perf_df['event'] = perf_df['event'].astype('category')
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
 
-    llc = perf_df[perf_df['event'].str.contains('LLC', na=False)]
-
-    grouped = llc.groupby(
-        ['mode', 'workload', 'event'],
-        observed=True
-    )['count'].sum().unstack(fill_value=0)
-
-    if 'LLC-load-misses' in grouped and 'LLC-loads' in grouped:
-        grouped['llc_miss_rate'] = grouped['LLC-load-misses'] / grouped['LLC-loads'].replace(0, np.nan)
-
-    return grouped.reset_index()
+    print(f"[JSON] saved: {out_path}")
 
 
 # ============================================================================
@@ -169,27 +163,50 @@ def calc_llc_miss_rate(perf_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('results_dir', type=Path)
+    parser = argparse.ArgumentParser(description="NUMA latency analysis (optimized)")
+    parser.add_argument("results_dir", type=Path)
+    parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--quiet", action="store_true")
+
     args = parser.parse_args()
 
-    results_dir = args.results_dir
+    if not args.results_dir.exists():
+        print("ERROR: results_dir not found", file=sys.stderr)
+        sys.exit(1)
 
-    df = load_combined(results_dir)
+    if not args.quiet:
+        print(f"[INFO] analyzing {args.results_dir}")
 
-    # ⚡ Векторизированный NUMA penalty
-    penalties = calc_numa_penalty_vectorized(df)
+    try:
+        df = load_combined(args.results_dir)
 
-    # ⚡ Streaming spikes
-    raw_iter = iter_raw_files(results_dir)
-    spike_summary = detect_spikes_streaming(raw_iter)
+        # ⚡ Векторизация вместо циклов
+        penalties = calc_numa_penalty(df)
 
-    # ⚡ Tail ratio без копии
-    calc_tail_ratio(df)
+        # ⚡ inplace операция
+        calc_tail_ratio(df)
 
-    print("Penalties:", len(penalties))
-    print("Spikes:", spike_summary)
+        # ⚡ streaming
+        spike_summary = detect_spikes_streaming(args.results_dir)
+
+        if not args.quiet:
+            print(f"[INFO] runs: {len(df)}")
+            print(f"[INFO] penalties: {len(penalties)}")
+            print(f"[INFO] spikes: {spike_summary.get('count', 0)}")
+
+        if args.json:
+            export_json(df, penalties, spike_summary, args.json)
+
+        if not args.quiet:
+            print("\n=== SAMPLE ===")
+            print(df.head(10).to_string(index=False))
+
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
